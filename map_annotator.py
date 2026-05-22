@@ -1,18 +1,16 @@
 """
-map_annotator.py — разметка зданий на карте с GUI-лончером.
+map_annotator.py — разметка зданий на карте (Tkinter Canvas).
 
-Установка: pip install opencv-python numpy
-           tkinter встроен в Python.
+Установка: pip install opencv-python numpy pillow
+Запуск:    python map_annotator.py
 
-Запуск: python map_annotator.py
 Горячие клавиши: Enter=confirm, A=align, R=ref, Z=undo, S=save, Q/Esc=quit
 
-Система координат
------------------
-  World Space (пиксели) = Screen Space - img_offset
-  Для первого скриншота offset=(0,0), поэтому world == screen pixel.
-  При загрузке нового скриншота: режим Align двигает фон, здания — трафарет.
-  После подтверждения Align img_offset задаёт соответствие screen↔world.
+Canvas = World Space.
+  - Карта лежит на холсте в позиции (img_offset_x, img_offset_y).
+  - Здания рисуются строго по мировым (canvas) координатам — без offset.
+  - Клик в DRAW: world_x = event.x, world_y = event.y (напрямую).
+  - ALIGN: drag двигает только карту; контуры зданий — неподвижный трафарет.
 """
 
 import cv2
@@ -20,267 +18,70 @@ import numpy as np
 import json
 import os
 import math
+import io
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    raise SystemExit("Установи Pillow: pip install pillow")
+
 
 # ── Конфиг ───────────────────────────────────────────────────────────────────
 
 class Cfg:
     map_path    = ""
     output_path = ""
-    world_x     = 180.0   # ширина карты в метрах (Godot X) — только для REF-дистанции
-    world_z     = 146.0   # глубина карты в метрах (Godot Z)
+    world_x     = 180.0   # метров по X (только для REF-дистанции)
+    world_z     = 146.0   # метров по Z
     buildings   = ["House_6", "House_29", "House_27"]
     snap_radius = 12
 
-FONT       = cv2.FONT_HERSHEY_SIMPLEX
+
 MODE_DRAW  = 0
 MODE_REF   = 1
 MODE_ALIGN = 2
 
-C_DONE    = (0, 200, 0)
-C_ACTIVE  = (0, 180, 255)
-C_DOT     = (0, 80, 255)
-C_SNAP    = (0, 220, 220)
-C_REF_A   = (60, 60, 255)
-C_REF_B   = (255, 130, 30)
-C_ARROW   = (200, 60, 220)
-C_CLOSE   = (120, 80, 200)
-C_STENCIL = (0, 200, 255)   # контуры-трафареты в режиме Align
+PANEL_W  = 180
 
-PANEL_W = 170
-
-PANEL_BUTTONS = [
-    ("Confirm  Enter",  (30, 160, 30),   "confirm"),
-    ("Align      A",    (160, 140, 0),   "align"),
-    ("Ref arrow  R",    (160, 0, 160),   "ref"),
-    ("Undo       Z",    (0, 120, 180),   "undo"),
-    ("Save       S",    (30, 100, 200),  "save"),
-    ("Exit       Q",    (30,  30, 160),  "quit"),
+# (label, normal_bg, active_bg, cmd)
+BTN_CFG = [
+    ("Confirm  Enter", "#1a7a1a", "#3aaa3a", "confirm"),
+    ("Align      A",   "#707000", "#a0a020", "align"),
+    ("Ref arrow  R",   "#6a006a", "#9a309a", "ref"),
+    ("Undo       Z",   "#005870", "#1088a0", "undo"),
+    ("Save       S",   "#0a4080", "#2a70c0", "save"),
+    ("Exit       Q",   "#0a0a50", "#303080", "quit"),
 ]
-BTN_H   = 44
-BTN_GAP = 8
-BTN_TOP = 72
 
 
-# ── Координатные утилиты ──────────────────────────────────────────────────────
+# ── Бизнес-логика: здания и JSON ──────────────────────────────────────────────
 
 def building_name(idx):
     return Cfg.buildings[idx] if idx < len(Cfg.buildings) else f"Object_{idx + 1}"
 
 
-def scale_mpp(img_shape):
-    """Метров на пиксель (для отображения дистанции в REF-стрелке)."""
-    h, w = img_shape[:2]
-    return Cfg.world_x / w, Cfg.world_z / h
-
-
-def screen_to_world(sx, sy, ox, oy):
-    """Экранные координаты → мировые пиксельные."""
-    return sx - ox, sy - oy
-
-
-def world_to_screen(wx, wy, ox, oy):
-    """Мировые пиксельные → экранные."""
-    return int(round(wx + ox)), int(round(wy + oy))
-
-
-def snap(world_mx, world_my, done):
-    """Притяжение к вершинам существующих полигонов (в мировых координатах)."""
-    best_d = Cfg.snap_radius + 1
-    best   = (world_mx, world_my)
-    for b in done:
-        for p in b["polygon"]:
-            d = math.hypot(world_mx - p[0], world_my - p[1])
-            if d < best_d:
-                best_d, best = d, (p[0], p[1])
-    return best, best_d <= Cfg.snap_radius
-
-
-def text_outlined(img, text, pos, scale, color, thickness=1):
-    cv2.putText(img, text, pos, FONT, scale, (255, 255, 255), thickness + 2, cv2.LINE_AA)
-    cv2.putText(img, text, pos, FONT, scale, color,           thickness,     cv2.LINE_AA)
-
-
-# ── Боковая панель ────────────────────────────────────────────────────────────
-
-def _btn_rect(i):
-    y0 = BTN_TOP + i * (BTN_H + BTN_GAP)
-    return y0, y0 + BTN_H
-
-
-def draw_panel(panel, mode, current_idx, n_pts, done):
-    panel[:] = (28, 28, 28)
-    h = panel.shape[0]
-
-    mode_str = ["DRAW", "REF ", "ALIGN"][mode]
-    bname    = building_name(current_idx)
-    cv2.putText(panel, f"Mode: {mode_str}",   (10, 22), FONT, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(panel, f"[{current_idx+1}] {bname}", (10, 44), FONT, 0.48, (180, 220, 180), 1, cv2.LINE_AA)
-    cv2.putText(panel, f"{n_pts} pts",         (10, 62), FONT, 0.45, (160, 160, 160), 1, cv2.LINE_AA)
-
-    for i, (label, color, cmd) in enumerate(PANEL_BUTTONS):
-        y0, y1 = _btn_rect(i)
-        if y1 > h - 4:
-            break
-        is_active = (mode == MODE_ALIGN and cmd == "align") or \
-                    (mode == MODE_REF   and cmd == "ref")
-        bg = tuple(min(255, c + 60) for c in color) if is_active else color
-        cv2.rectangle(panel, (4, y0), (PANEL_W - 4, y1), bg, -1)
-        cv2.rectangle(panel, (4, y0), (PANEL_W - 4, y1), (80, 80, 80), 1)
-        cv2.putText(panel, label, (10, y0 + BTN_H // 2 + 6), FONT, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-
-    list_y = BTN_TOP + len(PANEL_BUTTONS) * (BTN_H + BTN_GAP) + 16
-    cv2.putText(panel, "Done:", (10, list_y), FONT, 0.46, (140, 140, 140), 1, cv2.LINE_AA)
-    for i, b in enumerate(done):
-        ly = list_y + 18 + i * 18
-        if ly > h - 6:
-            break
-        cv2.putText(panel, b["name"], (10, ly), FONT, 0.42, (80, 200, 80), 1, cv2.LINE_AA)
-
-
-def panel_click(y):
-    for i, (_, _, cmd) in enumerate(PANEL_BUTTONS):
-        y0, y1 = _btn_rect(i)
-        if y0 <= y <= y1:
-            return cmd
-    return None
-
-
-# ── Отрисовка ─────────────────────────────────────────────────────────────────
-
-def draw_state(base_img, done, current_points, current_idx,
-               mode, ref_pts, mx, my, img_offset=(0, 0)):
-    ox, oy = img_offset
-
-    # Фоновое изображение смещается на img_offset
-    if ox != 0 or oy != 0:
-        M = np.float32([[1, 0, ox], [0, 1, oy]])
-        canvas = cv2.warpAffine(base_img, M, (base_img.shape[1], base_img.shape[0]))
-    else:
-        canvas = base_img.copy()
-
-    sx_mpp, sz_mpp = scale_mpp(base_img.shape)
-
-    # ── Существующие здания ──────────────────────────────────────────────────
-    for b in done:
-        if mode == MODE_ALIGN:
-            # Режим выравнивания: здания — неподвижный трафарет (world coords = screen coords)
-            pts = [(int(p[0]), int(p[1])) for p in b["polygon"]]
-            lbl_x, lbl_y = int(b["center_px"][0]), int(b["center_px"][1])
-            line_color = C_STENCIL
-            fill_color = (0, 80, 160)
-        else:
-            # Обычный режим: world + offset → screen
-            pts = [world_to_screen(p[0], p[1], ox, oy) for p in b["polygon"]]
-            lbl_x, lbl_y = world_to_screen(b["center_px"][0], b["center_px"][1], ox, oy)
-            line_color = C_DONE
-            fill_color = (0, 150, 0)
-
-        poly = np.array(pts, dtype=np.int32)
-        ol = canvas.copy()
-        cv2.fillPoly(ol, [poly], fill_color)
-        cv2.addWeighted(ol, 0.18, canvas, 0.82, 0, canvas)
-        cv2.polylines(canvas, [poly], True, line_color, 2)
-        text_outlined(canvas, b["name"], (lbl_x - 30, lbl_y - 5), 0.65, line_color)
-
-    # ── Snap-круг (только в режиме DRAW) ─────────────────────────────────────
-    if mx is not None and mode == MODE_DRAW and mx < base_img.shape[1]:
-        wmx, wmy = screen_to_world(mx, my, ox, oy)
-        pt_w, is_s = snap(wmx, wmy, done)
-        if is_s:
-            cv2.circle(canvas, world_to_screen(pt_w[0], pt_w[1], ox, oy), Cfg.snap_radius, C_SNAP, 2)
-
-    # ── Текущий контур (current_points в мировых координатах) ─────────────────
-    if current_points:
-        scr = [world_to_screen(p[0], p[1], ox, oy) for p in current_points]
-        arr = np.array(scr, dtype=np.int32)
-        if len(scr) >= 3:
-            ol = canvas.copy()
-            cv2.fillPoly(ol, [arr], (0, 90, 255))
-            cv2.addWeighted(ol, 0.14, canvas, 0.86, 0, canvas)
-        for i in range(len(scr) - 1):
-            cv2.line(canvas, scr[i], scr[i + 1], C_ACTIVE, 1)
-        if mx is not None and mode == MODE_DRAW:
-            cv2.line(canvas, scr[-1], (mx, my), C_ACTIVE, 1)
-            if len(scr) >= 2:
-                cv2.line(canvas, (mx, my), scr[0], C_CLOSE, 1)
-        for pt in scr:
-            cv2.circle(canvas, pt, 4, C_DOT, -1)
-
-    # ── Стрелка-референс (ref_pts в мировых координатах) ─────────────────────
-    if mode == MODE_REF:
-        p0_w = ref_pts[0] if ref_pts else None
-        p1_w = ref_pts[1] if len(ref_pts) >= 2 else None
-        p0 = world_to_screen(p0_w[0], p0_w[1], ox, oy) if p0_w else None
-        if p1_w:
-            p1 = world_to_screen(p1_w[0], p1_w[1], ox, oy)
-        elif p0_w and mx is not None:
-            p1 = (mx, my)
-        else:
-            p1 = None
-        if p0:
-            cv2.circle(canvas, p0, 7, C_REF_A, -1)
-            cv2.circle(canvas, p0, 7, (255, 255, 255), 1)
-        if p0 and p1:
-            cv2.arrowedLine(canvas, p0, p1, C_ARROW, 2, tipLength=0.04)
-            ddx, ddz = p1[0] - p0[0], p1[1] - p0[1]
-            dist_m = math.hypot(ddx * sx_mpp, ddz * sz_mpp)
-            ang    = math.degrees(math.atan2(ddz, ddx))
-            mid    = ((p0[0] + p1[0]) // 2 + 6, (p0[1] + p1[1]) // 2 - 6)
-            text_outlined(canvas, f"{dist_m:.1f}m  {ang:.1f}deg", mid, 0.55, C_ARROW)
-        if p1_w:
-            cv2.circle(canvas, p1, 7, C_REF_B, -1)
-            cv2.circle(canvas, p1, 7, (255, 255, 255), 1)
-
-    # ── Статус-бар ────────────────────────────────────────────────────────────
-    cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 30), (20, 20, 20), -1)
-    if mode == MODE_ALIGN:
-        s = f"ALIGN: drag map to match stencil  dx={ox:+d} dy={oy:+d}  |  Enter=confirm  A=cancel"
-        cv2.putText(canvas, s, (8, 21), FONT, 0.50, (0, 220, 255), 1, cv2.LINE_AA)
-    elif mode == MODE_REF:
-        if not ref_pts:        s = "REF: click anchor on existing building"
-        elif len(ref_pts) == 1: s = "REF: click start of new building"
-        else:                  s = "REF locked.  Z=reset"
-        cv2.putText(canvas, s, (8, 21), FONT, 0.56, (100, 200, 255), 1, cv2.LINE_AA)
-    else:
-        n = len(current_points)
-        need = "Enter=confirm" if n >= 3 else f"need {3 - n} more pts"
-        cv2.putText(canvas, f"[{current_idx+1}] {building_name(current_idx)}  {n} pts  |  {need}",
-                    (8, 21), FONT, 0.56, (255, 255, 255), 1, cv2.LINE_AA)
-
-    panel = np.zeros((canvas.shape[0], PANEL_W, 3), dtype=np.uint8)
-    draw_panel(panel, mode, current_idx, len(current_points), done)
-    return np.hstack([canvas, panel])
-
-
-# ── Вычисление здания ─────────────────────────────────────────────────────────
-
 def compute_building(name, world_points):
-    """Принимает точки в мировых пиксельных координатах."""
-    pts_arr = np.array(world_points, dtype=np.float32)
-    rect    = cv2.minAreaRect(pts_arr)
+    """Принимает мировые (canvas) координаты, возвращает запись здания."""
+    pts = np.array(world_points, dtype=np.float32)
+    rect = cv2.minAreaRect(pts)
     (cx, cy), (w, h), angle = rect
     return {
         "name":      name,
-        "center_px": (cx, cy),                          # мировые пиксельные
-        "polygon":   [list(p) for p in world_points],   # мировые пиксельные
+        "center_px": (float(cx), float(cy)),
+        "polygon":   [list(map(float, p)) for p in world_points],
         "width":     float(w),
         "length":    float(h),
         "angle":     float(angle),
     }
 
 
-# ── JSON ──────────────────────────────────────────────────────────────────────
-
-def build_json(img_shape, done):
-    h, w = img_shape[:2]
+def build_json(img_w, img_h, done):
     buildings = []
     for b in done:
         buildings.append({
             "name":             b["name"],
-            # center.x/z в мировых пикселях; json_to_scene.py использует эти значения
-            # как пиксельные координаты на исходном изображении (совпадают при offset=0)
             "center":           {"x": round(b["center_px"][0], 2),
                                  "z": round(b["center_px"][1], 2)},
             "size":             {"width":  round(b["width"],  2),
@@ -289,234 +90,443 @@ def build_json(img_shape, done):
             "polygon_world":    [[round(p[0], 2), round(p[1], 2)] for p in b["polygon"]],
         })
     return {
-        "format":    "pixel_world_v2",
-        "map_size":  {"width": w, "height": h},
+        "format":     "pixel_world_v2",
+        "map_size":   {"width": img_w, "height": img_h},
         "world_meta": {"world_x": Cfg.world_x, "world_z": Cfg.world_z},
-        "buildings": buildings,
+        "buildings":  buildings,
     }
 
 
-def load_existing(img_shape):
-    """Загружает здания из JSON, конвертируя старые форматы в мировые пиксельные координаты."""
+def load_existing(img_w, img_h):
     if not os.path.exists(Cfg.output_path):
         return []
     try:
         with open(Cfg.output_path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"Cannot load {Cfg.output_path}: {e}")
+        print(f"Cannot load JSON: {e}")
         return []
 
     fmt    = data.get("format", "")
-    img_h, img_w = img_shape[:2]
     result = []
 
     for b in data.get("buildings", []):
         name = b["name"]
 
         if fmt == "pixel_world_v2" and b.get("polygon_world"):
-            # Новый формат: polygon_world уже в мировых пиксельных координатах
             points = [tuple(p) for p in b["polygon_world"]]
 
         elif b.get("polygon_world"):
-            # Старый формат: polygon_world содержал метровые координаты Godot
-            # Обратная конвертация: meter → pixel
-            meta  = data.get("world_meta", {})
-            wx_m  = meta.get("world_x",   Cfg.world_x)
-            wz_m  = meta.get("world_z",   Cfg.world_z)
-            cx_m  = meta.get("center_wx", 0.0)
-            cz_m  = meta.get("center_wz", 0.0)
-            points = []
-            for p in b["polygon_world"]:
-                px = ((p[0] - cx_m) / wx_m + 0.5) * img_w
-                pz = ((p[1] - cz_m) / wz_m + 0.5) * img_h
-                points.append((px, pz))
+            # Старый формат: метровые координаты Godot → canvas-пиксели
+            meta = data.get("world_meta", {})
+            wx_m = meta.get("world_x",   Cfg.world_x)
+            wz_m = meta.get("world_z",   Cfg.world_z)
+            cx_m = meta.get("center_wx", 0.0)
+            cz_m = meta.get("center_wz", 0.0)
+            points = [
+                (((p[0] - cx_m) / wx_m + 0.5) * img_w,
+                 ((p[1] - cz_m) / wz_m + 0.5) * img_h)
+                for p in b["polygon_world"]
+            ]
 
         elif b.get("polygon_px"):
-            # Ещё более старый формат: пиксели оригинального изображения == мировые
             points = [tuple(p) for p in b["polygon_px"]]
 
         else:
-            # Самый старый формат: только bbox
-            cx, cy = b["center"]["x"], b["center"]["z"]
+            cx_b, cy_b = b["center"]["x"], b["center"]["z"]
             w2, h2 = b["size"]["width"], b["size"]["length"]
-            ang    = b["rotation_degrees"]
-            box    = cv2.boxPoints(((cx, cy), (w2, h2), ang)).astype(np.float32)
+            ang = b["rotation_degrees"]
+            box = cv2.boxPoints(((cx_b, cy_b), (w2, h2), ang)).astype(np.float32)
             points = [tuple(p) for p in box]
 
-        entry = compute_building(name, points)
-        result.append(entry)
+        result.append(compute_building(name, points))
         print(f"Loaded: {name}")
 
     return result
 
 
-# ── Основной цикл аннотатора ──────────────────────────────────────────────────
+# ── Аннотатор ─────────────────────────────────────────────────────────────────
 
-def run_annotator():
-    raw = np.fromfile(Cfg.map_path, dtype=np.uint8)
-    base_img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-    if base_img is None:
-        messagebox.showerror("Error", f"Cannot open:\n{Cfg.map_path}")
-        return
+class AnnotatorWindow:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("map_annotator")
+        root.configure(bg="#111111")
 
-    img_h, img_w = base_img.shape[:2]
+        # Загрузка карты
+        with open(Cfg.map_path, "rb") as fh:
+            raw = fh.read()
+        self.pil_img = Image.open(io.BytesIO(raw))
+        self.pil_img.load()
+        self.img_w, self.img_h = self.pil_img.size
+        self.map_photo = ImageTk.PhotoImage(self.pil_img)
 
-    done           = load_existing(base_img.shape)
-    current_points = []   # мировые пиксельные координаты
-    current_idx    = len(done)
-    mode           = MODE_DRAW
-    ref_pts        = []   # мировые пиксельные координаты
-    mouse          = [None, None]
-    img_offset     = [0, 0]
-    saved_offset   = [0, 0]   # сохранённый offset при входе в ALIGN (для отмены)
-    align_drag     = [False]
-    align_last     = [0, 0]
-    panel_cmd      = [None]
+        # Состояние
+        self.done           = load_existing(self.img_w, self.img_h)
+        self.current_points = []   # мировые (canvas) координаты
+        self.current_idx    = len(self.done)
+        self.mode           = MODE_DRAW
+        self.ref_pts        = []
 
-    window = "map_annotator"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, min(img_w + PANEL_W, 1560), min(img_h, 900))
+        # Смещение карты
+        self.img_offset_x = 0
+        self.img_offset_y = 0
+        self._saved_ox    = 0
+        self._saved_oy    = 0
 
-    def on_mouse(event, x, y, _flags, _param):
-        nonlocal current_points, current_idx, mode, ref_pts
-        mouse[0], mouse[1] = x, y
+        # Drag-состояние
+        self._dragging  = False
+        self._drag_lx   = 0
+        self._drag_ly   = 0
 
-        # Клик по боковой панели
-        if event == cv2.EVENT_LBUTTONDOWN and x >= img_w:
-            cmd = panel_click(y)
-            if cmd:
-                panel_cmd[0] = cmd
+        self._build_ui()
+        self._bind()
+        self.redraw_static()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        cw = min(self.img_w, sw - PANEL_W - 16)
+        ch = min(self.img_h, sh - 80)
+        self.root.geometry(f"{cw + PANEL_W}x{ch + 28}")
+        self.root.resizable(True, True)
+
+        wrap = tk.Frame(self.root, bg="#111111")
+        wrap.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(wrap, bg="#1a1a1a",
+                                 highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        panel = tk.Frame(wrap, width=PANEL_W, bg="#1c1c1c")
+        panel.pack(side="right", fill="y")
+        panel.pack_propagate(False)
+        self._build_panel(panel)
+
+        self.status_var = tk.StringVar()
+        tk.Label(self.root, textvariable=self.status_var,
+                  bg="#141414", fg="#d8d8d8", font=("Courier", 9),
+                  anchor="w", padx=8).pack(side="bottom", fill="x")
+
+    def _build_panel(self, panel):
+        tk.Label(panel, bg="#1c1c1c").pack(pady=4)
+
+        self.lbl_mode  = tk.Label(panel, text="Mode: DRAW",
+                                   bg="#1c1c1c", fg="#c0c0c0",
+                                   font=("Courier", 10, "bold"), anchor="w")
+        self.lbl_mode.pack(fill="x", padx=8)
+
+        self.lbl_bname = tk.Label(panel, text="",
+                                   bg="#1c1c1c", fg="#90cc90",
+                                   font=("Courier", 9), anchor="w")
+        self.lbl_bname.pack(fill="x", padx=8)
+
+        self.lbl_pts   = tk.Label(panel, text="0 pts",
+                                   bg="#1c1c1c", fg="#707070",
+                                   font=("Courier", 9), anchor="w")
+        self.lbl_pts.pack(fill="x", padx=8, pady=(0, 8))
+
+        self.btn_refs = {}
+        for label, norm_bg, _, cmd in BTN_CFG:
+            b = tk.Button(panel, text=label,
+                           bg=norm_bg, fg="white",
+                           font=("Courier", 9), relief="flat",
+                           padx=6, pady=5,
+                           activebackground="#606060",
+                           command=lambda c=cmd: self.action(c))
+            b.pack(fill="x", padx=6, pady=2)
+            self.btn_refs[cmd] = b
+
+        tk.Frame(panel, bg="#404040", height=1).pack(fill="x", padx=6, pady=6)
+        tk.Label(panel, text="Done:", bg="#1c1c1c", fg="#888888",
+                  font=("Courier", 9), anchor="w").pack(fill="x", padx=8)
+
+        self.done_frame = tk.Frame(panel, bg="#1c1c1c")
+        self.done_frame.pack(fill="both", padx=8)
+
+    # ── Отрисовка ─────────────────────────────────────────────────────────────
+
+    def redraw_static(self):
+        """Полная перерисовка: карта + здания + зафиксированные точки."""
+        self.canvas.delete("map", "building", "current", "dynamic")
+
+        # Карта — смещаемый слой
+        self.canvas.create_image(self.img_offset_x, self.img_offset_y,
+                                   anchor="nw", image=self.map_photo,
+                                   tags="map")
+
+        # Здания — строго по мировым координатам (без offset)
+        for b in self.done:
+            flat = [c for p in b["polygon"] for c in (float(p[0]), float(p[1]))]
+            if len(flat) >= 6:
+                self.canvas.create_polygon(
+                    *flat,
+                    fill="#003a00", stipple="gray25",
+                    outline="#00c800", width=2,
+                    tags="building")
+            cx, cy = b["center_px"]
+            self.canvas.create_text(
+                int(cx), int(cy),
+                text=b["name"],
+                fill="#00c800", font=("Helvetica", 9, "bold"),
+                tags="building")
+
+        # Зафиксированные точки текущего полигона
+        if len(self.current_points) >= 2:
+            flat = [c for p in self.current_points for c in (float(p[0]), float(p[1]))]
+            self.canvas.create_line(*flat, fill="#00b4ff", width=1, tags="current")
+        for p in self.current_points:
+            r = 4
+            self.canvas.create_oval(p[0]-r, p[1]-r, p[0]+r, p[1]+r,
+                                     fill="#0050ff", outline="",
+                                     tags="current")
+
+        self._refresh_panel()
+
+    def redraw_dynamic(self, mx, my):
+        """Быстрое частичное обновление: живая линия, snap, REF-стрелка."""
+        self.canvas.delete("dynamic")
+
+        if self.mode == MODE_DRAW and self.current_points:
+            lx, ly = self.current_points[-1]
+            self.canvas.create_line(lx, ly, mx, my,
+                                     fill="#00b4ff", width=1, tags="dynamic")
+            if len(self.current_points) >= 2:
+                fx, fy = self.current_points[0]
+                self.canvas.create_line(fx, fy, mx, my,
+                                         fill="#7850c8", width=1,
+                                         dash=(4, 4), tags="dynamic")
+
+        if self.mode == MODE_DRAW:
+            sp, snapped = self._snap(mx, my)
+            if snapped:
+                r = Cfg.snap_radius
+                self.canvas.create_oval(sp[0]-r, sp[1]-r, sp[0]+r, sp[1]+r,
+                                         outline="#00dcdc", width=2,
+                                         tags="dynamic")
+
+        if self.mode == MODE_REF and self.ref_pts:
+            p0 = self.ref_pts[0]
+            p1 = self.ref_pts[1] if len(self.ref_pts) >= 2 else (mx, my)
+            self.canvas.create_line(p0[0], p0[1], p1[0], p1[1],
+                                     fill="#c830e0", width=2,
+                                     arrow="last", arrowshape=(12, 16, 4),
+                                     tags="dynamic")
+            self.canvas.create_oval(p0[0]-6, p0[1]-6, p0[0]+6, p0[1]+6,
+                                     fill="#3c3cff", outline="white",
+                                     tags="dynamic")
+            if len(self.ref_pts) >= 2:
+                self.canvas.create_oval(p1[0]-6, p1[1]-6, p1[0]+6, p1[1]+6,
+                                         fill="#ff8200", outline="white",
+                                         tags="dynamic")
+                sx = Cfg.world_x / self.img_w
+                sz = Cfg.world_z / self.img_h
+                dist_m = math.hypot((p1[0]-p0[0])*sx, (p1[1]-p0[1])*sz)
+                ang    = math.degrees(math.atan2(p1[1]-p0[1], p1[0]-p0[0]))
+                self.canvas.create_text(
+                    (p0[0]+p1[0])//2 + 8, (p0[1]+p1[1])//2 - 12,
+                    text=f"{dist_m:.1f}m  {ang:.1f}°",
+                    fill="#c830e0", font=("Courier", 9),
+                    tags="dynamic")
+
+    # ── Snap ─────────────────────────────────────────────────────────────────
+
+    def _snap(self, wx, wy):
+        best_d, best = Cfg.snap_radius + 1, (wx, wy)
+        for b in self.done:
+            for p in b["polygon"]:
+                d = math.hypot(wx - p[0], wy - p[1])
+                if d < best_d:
+                    best_d, best = d, (p[0], p[1])
+        return best, best_d <= Cfg.snap_radius
+
+    # ── События ───────────────────────────────────────────────────────────────
+
+    def on_press(self, event):
+        x, y = event.x, event.y
+
+        if self.mode == MODE_ALIGN:
+            self._dragging = True
+            self._drag_lx, self._drag_ly = x, y
+            self.canvas.config(cursor="fleur")
             return
 
-        # ── Режим выравнивания: drag двигает карту ──────────────────────────
-        if mode == MODE_ALIGN:
-            if event == cv2.EVENT_LBUTTONDOWN:
-                align_drag[0] = True
-                align_last[0], align_last[1] = x, y
-            elif event == cv2.EVENT_MOUSEMOVE and align_drag[0]:
-                img_offset[0] += x - align_last[0]
-                img_offset[1] += y - align_last[1]
-                align_last[0], align_last[1] = x, y
-            elif event == cv2.EVENT_LBUTTONUP:
-                align_drag[0] = False
-            return
+        # Координата клика = мировая координата (Canvas IS world space)
+        sp, snapped = self._snap(x, y)
+        pt = sp if snapped else (float(x), float(y))
 
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-
-        # Конвертируем экран → мировые координаты
-        wmx, wmy = screen_to_world(x, y, img_offset[0], img_offset[1])
-        pt_w, is_s = snap(wmx, wmy, done)
-        pt = pt_w if is_s else (wmx, wmy)
-
-        if mode == MODE_REF:
-            ref_pts.append(pt)
-            if len(ref_pts) == 2:
-                current_points = [ref_pts[1]]
-                mode = MODE_DRAW
-                ref_pts = []
-            return
-        current_points.append(pt)
-
-    cv2.setMouseCallback(window, on_mouse)
-
-    def handle_action(action):
-        nonlocal current_points, current_idx, mode, ref_pts
-        if action == "confirm":
-            if mode == MODE_ALIGN:
-                # Подтверждаем выравнивание: img_offset уже корректный, просто выходим
-                mode = MODE_DRAW
-            elif mode == MODE_DRAW and len(current_points) >= 3:
-                b = compute_building(building_name(current_idx), current_points)
-                done.append(b)
-                current_points = []
-                current_idx += 1
-
-        elif action == "align":
-            if mode == MODE_DRAW:
-                # Входим в режим выравнивания, сохраняем текущий offset для отмены
-                saved_offset[0], saved_offset[1] = img_offset[0], img_offset[1]
-                align_drag[0] = False
-                mode = MODE_ALIGN
-            elif mode == MODE_ALIGN:
-                # Отмена: восстанавливаем offset
-                img_offset[0], img_offset[1] = saved_offset[0], saved_offset[1]
-                mode = MODE_DRAW
-
-        elif action == "ref":
-            if mode != MODE_ALIGN:
-                mode = MODE_REF if mode == MODE_DRAW else MODE_DRAW
-                ref_pts = []
-
-        elif action == "undo":
-            if mode == MODE_REF:
-                if ref_pts: ref_pts.pop()
-                else: mode = MODE_DRAW
-            elif mode == MODE_DRAW:
-                if current_points:
-                    current_points.pop()
-                elif done:
-                    last = done.pop()
-                    current_idx -= 1
-                    current_points = [tuple(p) for p in last["polygon"]]
-                    print(f"Undone: {last['name']}")
-
-        elif action == "save":
-            if not done:
-                print("Nothing to save.")
+        if self.mode == MODE_REF:
+            self.ref_pts.append(pt)
+            if len(self.ref_pts) == 2:
+                self.current_points = [self.ref_pts[1]]
+                self.mode  = MODE_DRAW
+                self.ref_pts = []
+                self.redraw_static()
             else:
-                data = build_json(base_img.shape, done)
-                with open(Cfg.output_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                print(f"Saved: {Cfg.output_path}")
+                self.redraw_dynamic(x, y)
+            return
 
-        elif action == "quit":
-            return True
+        self.current_points.append(pt)
+        self.redraw_static()
+        self.redraw_dynamic(x, y)
 
-        return False
+    def on_drag(self, event):
+        x, y = event.x, event.y
+        if self.mode == MODE_ALIGN and self._dragging:
+            dx = x - self._drag_lx
+            dy = y - self._drag_ly
+            self.img_offset_x += dx
+            self.img_offset_y += dy
+            self._drag_lx, self._drag_ly = x, y
+            # Двигаем ТОЛЬКО карту; здания ("building") остаются неподвижными
+            self.canvas.move("map", dx, dy)
+            self._update_status()
+        else:
+            self.redraw_dynamic(x, y)
 
-    while True:
-        frame = draw_state(base_img, done, current_points, current_idx,
-                           mode, ref_pts, mouse[0], mouse[1], tuple(img_offset))
-        try:
-            cv2.imshow(window, frame)
-            key = cv2.waitKey(20) & 0xFF
-            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-                break
-        except cv2.error:
-            break
+    def on_release(self, *_):
+        if self.mode == MODE_ALIGN:
+            self._dragging = False
+            self.canvas.config(cursor="crosshair")
 
-        if panel_cmd[0]:
-            if handle_action(panel_cmd[0]):
-                break
-            panel_cmd[0] = None
+    def on_motion(self, event):
+        if self.mode != MODE_ALIGN:
+            self.redraw_dynamic(event.x, event.y)
 
-        if key in (ord('q'), 27):
-            break
-        elif key in (13,):          # Enter
-            handle_action("confirm")
-        elif key in (ord('a'), ord('A')):
-            handle_action("align")
-        elif key in (ord('r'), ord('R')):
-            handle_action("ref")
-        elif key in (ord('z'), ord('Z')):
-            handle_action("undo")
-        elif key in (ord('s'), ord('S')):
-            handle_action("save")
+    # ── Команды ───────────────────────────────────────────────────────────────
 
-    cv2.destroyAllWindows()
-    cv2.waitKey(1)
+    def action(self, cmd):
+        if cmd == "confirm":
+            if self.mode == MODE_ALIGN:
+                self.mode = MODE_DRAW
+                self.canvas.config(cursor="crosshair")
+                self.redraw_static()
+            elif self.mode == MODE_DRAW and len(self.current_points) >= 3:
+                b = compute_building(building_name(self.current_idx),
+                                     self.current_points)
+                self.done.append(b)
+                self.current_points = []
+                self.current_idx   += 1
+                self.redraw_static()
+
+        elif cmd == "align":
+            if self.mode == MODE_DRAW:
+                self._saved_ox, self._saved_oy = self.img_offset_x, self.img_offset_y
+                self.mode = MODE_ALIGN
+                self._dragging = False
+                self.canvas.config(cursor="fleur")
+                self._refresh_panel()
+                self._update_status()
+            elif self.mode == MODE_ALIGN:
+                # Отмена — восстанавливаем offset
+                dx = self._saved_ox - self.img_offset_x
+                dy = self._saved_oy - self.img_offset_y
+                self.img_offset_x = self._saved_ox
+                self.img_offset_y = self._saved_oy
+                self.canvas.move("map", dx, dy)
+                self.mode = MODE_DRAW
+                self.canvas.config(cursor="crosshair")
+                self._refresh_panel()
+                self._update_status()
+
+        elif cmd == "ref":
+            if self.mode != MODE_ALIGN:
+                self.mode    = MODE_REF if self.mode == MODE_DRAW else MODE_DRAW
+                self.ref_pts = []
+                self._refresh_panel()
+                self._update_status()
+
+        elif cmd == "undo":
+            if self.mode == MODE_REF:
+                if self.ref_pts: self.ref_pts.pop()
+                else: self.mode = MODE_DRAW
+            elif self.mode == MODE_DRAW:
+                if self.current_points:
+                    self.current_points.pop()
+                elif self.done:
+                    last = self.done.pop()
+                    self.current_idx  -= 1
+                    self.current_points = [tuple(p) for p in last["polygon"]]
+                    print(f"Undone: {last['name']}")
+            self.redraw_static()
+
+        elif cmd == "save":
+            if not self.done:
+                print("Nothing to save.")
+                return
+            data = build_json(self.img_w, self.img_h, self.done)
+            with open(Cfg.output_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"Saved → {Cfg.output_path}")
+
+        elif cmd == "quit":
+            self.root.destroy()
+
+    # ── Обновление панели / статуса ───────────────────────────────────────────
+
+    def _refresh_panel(self):
+        mode_str = ["DRAW", "REF", "ALIGN"][self.mode]
+        self.lbl_mode.config(text=f"Mode: {mode_str}")
+        self.lbl_bname.config(text=f"[{self.current_idx+1}] {building_name(self.current_idx)}")
+        self.lbl_pts.config(text=f"{len(self.current_points)} pts")
+
+        for _, norm_bg, act_bg, cmd in BTN_CFG:
+            is_active = (cmd == "align" and self.mode == MODE_ALIGN) or \
+                        (cmd == "ref"   and self.mode == MODE_REF)
+            self.btn_refs[cmd].config(bg=act_bg if is_active else norm_bg)
+
+        # Done-список
+        for w in self.done_frame.winfo_children():
+            w.destroy()
+        for b in self.done:
+            tk.Label(self.done_frame, text=b["name"],
+                      bg="#1c1c1c", fg="#48c048",
+                      font=("Courier", 9), anchor="w").pack(fill="x")
+
+        self._update_status()
+
+    def _update_status(self):
+        if self.mode == MODE_ALIGN:
+            ox, oy = self.img_offset_x, self.img_offset_y
+            s = f"ALIGN  img_offset=({ox:+d}, {oy:+d})  |  drag=move map  Enter=confirm  A=cancel"
+        elif self.mode == MODE_REF:
+            steps = ["click anchor on existing building",
+                     "click start of new building",
+                     "locked — Z to reset"]
+            s = "REF: " + steps[min(len(self.ref_pts), 2)]
+        else:
+            n     = len(self.current_points)
+            hint  = "Enter=confirm" if n >= 3 else f"need {3-n} more pts"
+            s = f"DRAW  [{self.current_idx+1}] {building_name(self.current_idx)}  {n} pts  |  {hint}"
+        self.status_var.set(s)
+
+    # ── Бинды ─────────────────────────────────────────────────────────────────
+
+    def _bind(self):
+        c = self.canvas
+        c.bind("<ButtonPress-1>",   self.on_press)
+        c.bind("<B1-Motion>",       self.on_drag)
+        c.bind("<ButtonRelease-1>", self.on_release)
+        c.bind("<Motion>",          self.on_motion)
+
+        for key, act in [("<Return>", "confirm"),
+                          ("<KeyPress-a>", "align"), ("<KeyPress-A>", "align"),
+                          ("<KeyPress-r>", "ref"),   ("<KeyPress-R>", "ref"),
+                          ("<KeyPress-z>", "undo"),  ("<KeyPress-Z>", "undo"),
+                          ("<KeyPress-s>", "save"),  ("<KeyPress-S>", "save"),
+                          ("<KeyPress-q>", "quit"),  ("<Escape>",     "quit")]:
+            self.root.bind(key, lambda _, a=act: self.action(a))
 
 
-# ── Tkinter-лончер ────────────────────────────────────────────────────────────
+# ── Лончер ────────────────────────────────────────────────────────────────────
 
 class Launcher:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Map Annotator")
+        root.title("Map Annotator — Launcher")
         root.resizable(False, False)
-
         P = {"padx": 8, "pady": 4}
 
         tk.Label(root, text="Map:").grid(row=0, column=0, sticky="w", **P)
@@ -535,17 +545,17 @@ class Launcher:
             ("Width X:", "wx_var", Cfg.world_x),
             ("Depth Z:", "wz_var", Cfg.world_z),
         ]):
-            tk.Label(sf, text=lbl).grid(row=0, column=col * 2, **P)
+            tk.Label(sf, text=lbl).grid(row=0, column=col*2, **P)
             v = tk.StringVar(value=str(default)); setattr(self, attr, v)
-            tk.Entry(sf, textvariable=v, width=8).grid(row=0, column=col * 2 + 1, **P)
+            tk.Entry(sf, textvariable=v, width=8).grid(row=0, column=col*2+1, **P)
 
         bf = tk.LabelFrame(root, text="Buildings (annotation order)")
         bf.grid(row=3, column=0, columnspan=3, sticky="ew", **P)
         self.listbox = tk.Listbox(bf, height=7, width=28, selectmode=tk.SINGLE)
         self.listbox.grid(row=0, column=0, rowspan=4, padx=8, pady=4)
-        scroll = tk.Scrollbar(bf, command=self.listbox.yview)
-        scroll.grid(row=0, column=1, rowspan=4, sticky="ns", pady=4)
-        self.listbox.config(yscrollcommand=scroll.set)
+        sb = tk.Scrollbar(bf, command=self.listbox.yview)
+        sb.grid(row=0, column=1, rowspan=4, sticky="ns", pady=4)
+        self.listbox.config(yscrollcommand=sb.set)
         for b in Cfg.buildings:
             self.listbox.insert(tk.END, b)
         self.name_var = tk.StringVar()
@@ -585,20 +595,18 @@ class Launcher:
     def _add(self):
         name = self.name_var.get().strip()
         if name:
-            self.listbox.insert(tk.END, name)
-            self.name_var.set("")
+            self.listbox.insert(tk.END, name); self.name_var.set("")
 
     def _remove(self):
         sel = self.listbox.curselection()
-        if sel:
-            self.listbox.delete(sel[0])
+        if sel: self.listbox.delete(sel[0])
 
     def _move_up(self):
         sel = self.listbox.curselection()
         if sel and sel[0] > 0:
-            i = sel[0]; val = self.listbox.get(i)
-            self.listbox.delete(i); self.listbox.insert(i - 1, val)
-            self.listbox.select_set(i - 1)
+            i = sel[0]; v = self.listbox.get(i)
+            self.listbox.delete(i); self.listbox.insert(i-1, v)
+            self.listbox.select_set(i-1)
 
     def _launch(self):
         map_path = self.img_var.get().strip()
@@ -616,9 +624,11 @@ class Launcher:
         Cfg.world_x     = wx
         Cfg.world_z     = wz
         Cfg.buildings   = list(self.listbox.get(0, tk.END))
-        self.root.withdraw()
-        run_annotator()
-        self.root.destroy()
+        # Морфируем лончер → аннотатор в том же окне
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.resizable(True, True)
+        AnnotatorWindow(self.root)
 
 
 # ── Точка входа ───────────────────────────────────────────────────────────────
